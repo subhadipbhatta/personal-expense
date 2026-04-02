@@ -1,0 +1,359 @@
+/**
+ * AI-Enhanced Message Handler
+ * Uses Claude AI for natural language understanding with fallback to rule-based parsing
+ */
+
+import logger from '../utils/logger.js';
+import { parseCommand } from '../utils/commandParser.js';
+import { handleExpenseCommand } from '../modules/expenses/handler.js';
+import { handleSettleCommand } from '../modules/settlements/handler.js';
+import { handleBalanceCommand } from '../modules/balance/handler.js';
+import { handleCalendarCommand, handleListEventsCommand } from '../modules/calendar/handler.js';
+import { handlePollCommand } from '../modules/polls/handler.js';
+import { handleReminderCommand, handleListRemindersCommand, handleCancelReminderCommand } from '../modules/reminders/handler.js';
+import { isAIEnabled, parseExpenseIntent } from '../ai/claudeService.js';
+import { buildGroupContext, getSenderName } from '../ai/contextBuilder.js';
+import { sendMessage } from './messageHandler.js';
+import {
+  detectConversationalIntent,
+  handleGreeting,
+  handleThankYou,
+  handleWellbeingCheck,
+  provideSuggestions
+} from '../modules/conversational/handler.js';
+import { isConversationalQuery, handleConversationalQuery } from '../ai/conversationalAI.js';
+
+const TRIGGER = process.env.BOT_TRIGGER || '@anukul';
+
+/**
+ * Handle message with AI-powered natural language understanding
+ *
+ * @param {object} sock - WhatsApp socket
+ * @param {object} message - WhatsApp message object
+ */
+export async function handleMessageWithAI(sock, message) {
+  try {
+    const messageText = extractMessageText(message);
+    if (!messageText) return;
+
+    // Check if message is for this bot
+    if (!messageText.toLowerCase().includes(TRIGGER.toLowerCase())) {
+      return;
+    }
+
+    const groupId = message.key.remoteJid;
+    const senderId = message.key.participant || message.key.remoteJid;
+    const isGroup = groupId.endsWith('@g.us');
+
+    // Only work in groups
+    if (!isGroup) {
+      await sendMessage(sock, groupId, '❌ This bot only works in WhatsApp groups.');
+      return;
+    }
+
+    // Check for simple conversational patterns first (greetings, thanks, etc.)
+    const conversationalIntent = detectConversationalIntent(messageText);
+    if (conversationalIntent) {
+      logger.info({ intent: conversationalIntent.type, groupId }, 'Handling simple conversational message');
+
+      switch (conversationalIntent.type) {
+        case 'greeting':
+          await handleGreeting(sock, message, conversationalIntent.match);
+          return;
+
+        case 'thankYou':
+          await handleThankYou(sock, message);
+          return;
+
+        case 'wellbeing':
+          await handleWellbeingCheck(sock, message);
+          return;
+
+        case 'suggestions':
+          await provideSuggestions(sock, message, conversationalIntent.context);
+          return;
+
+        case 'help':
+          await sendHelpMessage(sock, groupId);
+          return;
+      }
+    }
+
+    // Check if this is a conversational query (questions, requests for analysis)
+    if (isAIEnabled() && isConversationalQuery(userInput)) {
+      logger.info({ userInput, groupId }, 'Detected conversational query, using AI');
+
+      try {
+        const groupMetadata = await sock.groupMetadata(groupId);
+        const senderName = await getSenderName(sock, groupMetadata, senderId);
+
+        const aiResponse = await handleConversationalQuery(
+          userInput,
+          groupId,
+          groupMetadata,
+          senderName
+        );
+
+        if (aiResponse) {
+          await sendMessage(sock, groupId, aiResponse);
+          return;
+        } else {
+          logger.info('AI returned no response, falling back to command parsing');
+        }
+      } catch (error) {
+        logger.error({ error }, 'Error in conversational AI, falling back');
+      }
+    }
+
+    // Remove trigger from message
+    const userInput = messageText.replace(new RegExp(TRIGGER, 'gi'), '').trim();
+
+    if (!userInput) {
+      await sendHelpMessage(sock, groupId);
+      return;
+    }
+
+    // Try AI-powered parsing if enabled
+    if (isAIEnabled()) {
+      logger.info('AI enabled - attempting natural language processing');
+
+      try {
+        const groupMetadata = await sock.groupMetadata(groupId);
+        const groupContext = await buildGroupContext(sock, groupId);
+        const senderName = await getSenderName(sock, groupMetadata, senderId);
+
+        const aiResponse = await parseExpenseIntent(userInput, senderName, groupContext);
+
+        if (aiResponse && aiResponse.confidence > 0.6) {
+          logger.info({ aiResponse }, 'AI parsed intent successfully');
+          await handleAIResponse(sock, message, aiResponse, groupContext, senderName);
+          return;
+        } else {
+          logger.info('AI confidence too low, falling back to rule-based parsing');
+        }
+
+      } catch (aiError) {
+        logger.warn({ aiError }, 'AI parsing failed, falling back to rule-based');
+      }
+    }
+
+    // Fallback to rule-based parsing
+    logger.info('Using rule-based command parsing');
+    const command = parseCommand(messageText, TRIGGER);
+    logger.info({ command, groupId, senderId }, 'Processing command (rule-based)');
+
+    // Route to appropriate handler
+    switch (command.action) {
+      case 'add':
+      case 'split':
+        await handleExpenseCommand(sock, message, command);
+        break;
+
+      case 'settle':
+      case 'paid':
+        await handleSettleCommand(sock, message, command);
+        break;
+
+      case 'balance':
+      case 'balances':
+      case 'summary':
+        await handleBalanceCommand(sock, message, command);
+        break;
+
+      case 'calendar':
+      case 'schedule':
+      case 'event':
+        await handleCalendarCommand(sock, message, command);
+        break;
+
+      case 'list-events':
+      case 'events':
+        await handleListEventsCommand(sock, message);
+        break;
+
+      case 'poll':
+        await handlePollCommand(sock, message, command);
+        break;
+
+      case 'reminder':
+      case 'remind':
+        await handleReminderCommand(sock, message, command);
+        break;
+
+      case 'list-reminders':
+      case 'reminders':
+        await handleListRemindersCommand(sock, message);
+        break;
+
+      case 'cancel-reminder':
+        await handleCancelReminderCommand(sock, message, command);
+        break;
+
+      case 'help':
+      default:
+        await sendHelpMessage(sock, groupId);
+        break;
+    }
+
+  } catch (error) {
+    logger.error('Error in AI message handler:', error);
+    const groupId = message.key.remoteJid;
+    await sendMessage(sock, groupId, '❌ Sorry, something went wrong. Please try again.');
+  }
+}
+
+/**
+ * Handle AI-parsed response
+ *
+ * @param {object} sock - WhatsApp socket
+ * @param {object} message - Original message
+ * @param {object} aiResponse - Parsed AI response
+ * @param {object} groupContext - Group context
+ * @param {string} senderName - Sender's name
+ */
+async function handleAIResponse(sock, message, aiResponse, groupContext, senderName) {
+  const groupId = message.key.remoteJid;
+
+  // Handle clarification requests
+  if (aiResponse.needs_clarification) {
+    await sendMessage(sock, groupId, aiResponse.message);
+    return;
+  }
+
+  // Route based on action type
+  switch (aiResponse.action) {
+    case 'add_expense':
+      await handleAIExpense(sock, message, aiResponse, senderName);
+      break;
+
+    case 'settle':
+      await handleAISettle(sock, message, aiResponse, senderName);
+      break;
+
+    case 'balance':
+      await handleBalanceCommand(sock, message, {});
+      break;
+
+    case 'help':
+      await sendHelpMessage(sock, groupId);
+      break;
+
+    case 'error':
+    case 'clarify':
+      await sendMessage(sock, groupId, aiResponse.message);
+      break;
+
+    default:
+      logger.warn({ action: aiResponse.action }, 'Unknown AI action type');
+      await sendMessage(sock, groupId, aiResponse.message || '❌ Could not understand the request.');
+  }
+}
+
+/**
+ * Handle AI-parsed expense
+ */
+async function handleAIExpense(sock, message, aiResponse, senderName) {
+  const extracted = aiResponse.extracted_data;
+
+  // Convert AI response to command format for existing handler
+  const command = {
+    action: 'add',
+    amount: extracted.amount,
+    description: extracted.description || 'Expense',
+    mentions: extracted.participants
+      ?.filter(p => p !== 'sender' && p !== senderName)
+      .map(p => p.toLowerCase()) || [],
+    rawText: aiResponse.message
+  };
+
+  // If payer is "sender", use actual sender
+  if (extracted.payer === 'sender') {
+    // Expense paid by sender, handled by existing logic
+  }
+
+  await handleExpenseCommand(sock, message, command);
+}
+
+/**
+ * Handle AI-parsed settlement
+ */
+async function handleAISettle(sock, message, aiResponse, senderName) {
+  const extracted = aiResponse.extracted_data;
+
+  // Convert to command format
+  const command = {
+    action: 'settle',
+    amount: extracted.amount,
+    mentions: [extracted.settle_to],
+    description: extracted.description || 'Settlement'
+  };
+
+  await handleSettleCommand(sock, message, command);
+}
+
+/**
+ * Extract message text from WhatsApp message object
+ */
+function extractMessageText(message) {
+  return (
+    message.message?.conversation ||
+    message.message?.extendedTextMessage?.text ||
+    message.message?.imageMessage?.caption ||
+    ''
+  );
+}
+
+/**
+ * Send help message
+ */
+async function sendHelpMessage(sock, groupId) {
+  const aiMode = isAIEnabled() ? '🤖 AI-Powered' : '';
+
+  const helpText = `
+*💰 Anukul - Your WhatsApp Assistant ${aiMode}*
+
+👋 I'm conversational! Talk to me naturally or use commands.
+
+${isAIEnabled() ? `
+*Natural Language Examples:*
+"${TRIGGER} I paid 50 for lunch with john"
+"${TRIGGER} remind me to check expenses tomorrow"
+"${TRIGGER} schedule meeting Friday 3pm"
+"${TRIGGER} hi! what can you help with?"
+` : ''}
+
+*📊 Expenses:*
+${TRIGGER} add expense $50 dinner
+${TRIGGER} balance expense
+
+*📅 Calendar:*
+${TRIGGER} book calendar Meeting tomorrow 3pm
+${TRIGGER} list events
+
+*📊 Polls:*
+${TRIGGER} create poll What to eat? Pizza, Burgers
+${TRIGGER} poll Best time? 2pm, 3pm
+
+*⏰ Reminders:*
+${TRIGGER} remind me to Pay bills Friday
+${TRIGGER} list reminders
+
+*💬 Try Saying:*
+• ${TRIGGER} hello
+• ${TRIGGER} what can you do?
+• ${TRIGGER} suggest something
+• ${TRIGGER} thank you
+
+${isAIEnabled() ? `
+💡 *Tip:* Just chat with me naturally - I'll understand!
+` : `
+💡 *Tip:* I'm friendly! Say hi or ask for suggestions!
+`}
+
+Let's make group management easy! 🚀
+  `.trim();
+
+  await sendMessage(sock, groupId, helpText);
+}
+
+export default handleMessageWithAI;

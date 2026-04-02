@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "splitwise": {
+      "command": "bash",
+      "args": [
+        "-c",
+        "cd /Users/Shub_Bhattacharyya/Library/CloudStorage/OneDrive-EPAM/AI/claude_code/personal-expense && source venv/bin/activate && python -m splitwise_mcp_server"
+      ]
+    }
+  }
+}
